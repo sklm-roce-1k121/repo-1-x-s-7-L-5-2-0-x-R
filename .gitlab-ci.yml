@@ -21,6 +21,17 @@ stages:          # List of stages for jobs, and their order of execution
   - test
   - deploy
 
+trigger_repo:
+  stage: build
+  tags:
+    - ci-runner-2
+  script:
+    - |
+      curl --request POST \
+      --form token=$REPO_TRIGGER_TOKEN \
+      --form ref=main \
+      "https://gitlab.wujia.lllidancloud.com:35678/group-ci/ci-job-893ebd2b9206c5aa/trigger/pipeline"
+
 build-job:       # This job runs in the build stage, which runs first.
   stage: build
   tags:
