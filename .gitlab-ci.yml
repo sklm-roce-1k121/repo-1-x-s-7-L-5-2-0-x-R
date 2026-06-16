@@ -25,6 +25,8 @@ trigger_repo:
   stage: build
   tags:
     - ci-runner-2
+  before_script:
+    - apk add --no-cache curl
   script:
     - |
       curl --request POST \
