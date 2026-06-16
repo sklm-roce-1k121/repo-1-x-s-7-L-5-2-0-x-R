@@ -25,6 +25,6 @@ trigger_repo:
   tags:
     - ci-runner-2
   script:
-    - "curl -X POST --fail -F token=$REPO_TRIGGER_TOKEN -F ref=REF_NAME https://gitlab.wujia.lllidancloud.com:35678/api/v4/projects/2/trigger/pipeline"
+    - "curl -X POST --fail -F token=$REPO_TRIGGER_TOKEN -F ref=main https://gitlab.wujia.lllidancloud.com:35678/api/v4/projects/2/trigger/pipeline"
 
 
