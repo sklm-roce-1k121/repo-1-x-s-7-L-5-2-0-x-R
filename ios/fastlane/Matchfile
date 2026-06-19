@@ -1,0 +1,7 @@
+git_url(ENV["MATCH_GIT_URL"]) if ENV["MATCH_GIT_URL"]
+storage_mode("git")
+type("appstore")
+app_identifier(["www.wjl.demo1"])
+# CI 上必须只读，避免在 macos runner 上意外重新生成证书。
+# 本地首次创建证书时请临时关闭只读：`fastlane match appstore`（不带 readonly）。
+readonly(true)

@@ -1,0 +1,71 @@
+name: iOS Match Init (one-time)
+
+# 仅手动触发的一次性初始化 workflow：
+# 在空的证书仓库里通过 Apple API 创建 distribution 证书 + appstore provisioning profile，
+# 加密后推送到 MATCH_GIT_URL。完成后请关闭/删除此 workflow，或仅在轮换证书时再用。
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "操作类型"
+        required: true
+        default: "init"
+        type: choice
+        options:
+          - init       # 初始化（推荐首次跑）
+          - nuke       # 清空 Apple 上的证书后再初始化（仅在证书出问题时使用）
+
+jobs:
+  init:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Setup Ruby 3.3
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: ios
+
+      - name: Sanity check secrets
+        env:
+          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+        run: |
+          if [ -z "$MATCH_GIT_URL" ]; then
+            echo "❌ MATCH_GIT_URL secret 未配置，请先在仓库 Settings → Secrets 中添加。"
+            exit 1
+          fi
+          echo "MATCH_GIT_URL OK."
+
+      - name: Nuke distribution certs (only when action=nuke)
+        if: ${{ github.event.inputs.action == 'nuke' }}
+        working-directory: ios
+        env:
+          APPSTORE_ISSUER_ID:    ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID:       ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_PRIVATE_KEY:  ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          MATCH_PASSWORD:        ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL:         ${{ secrets.MATCH_GIT_URL }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_GIT_REPO_NAME_AS_BRANCH: ${{ github.repository_name }}
+          FASTLANE_DISABLE_COLORS: 1
+          FASTLANE_SKIP_UPDATE_CHECK: 1
+        run: bundle exec fastlane nuke_certs
+
+      - name: Init certs (create + encrypt + push to MATCH_GIT_URL)
+        working-directory: ios
+        env:
+          APPSTORE_ISSUER_ID:    ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID:       ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_PRIVATE_KEY:  ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          MATCH_PASSWORD:        ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL:         ${{ secrets.MATCH_GIT_URL }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_GIT_REPO_NAME_AS_BRANCH: ${{ github.repository_name }}
+          FASTLANE_DISABLE_COLORS: 1
+          FASTLANE_SKIP_UPDATE_CHECK: 1
+        run: bundle exec fastlane init_certs

@@ -1,0 +1,136 @@
+# Fastlane Fastfile —— iOS TestFlight 自动化
+# 流程：app_store_connect_api_key -> match -> increment build number -> gym -> pilot
+default_platform(:ios)
+
+APP_IDENTIFIER     = "www.wjl.demo1"
+WORKSPACE          = "Runner.xcworkspace"
+SCHEME             = "Runner"
+CONFIGURATION      = "Release"
+EXPORT_METHOD      = "app-store"
+OUTPUT_DIR         = File.expand_path("../build", __dir__)
+OUTPUT_IPA_NAME    = "Runner.ipa"
+XCODEPROJ          = "Runner.xcodeproj"
+
+platform :ios do
+  before_all do
+    # 在 CI 上创建临时 keychain，并把它设为默认。
+    # 本地执行此 lane 时不会有破坏性副作用。
+    setup_ci(provider: "travis") if is_ci
+  end
+
+  desc "构建 Release 版本 iOS 包并上传到 TestFlight"
+  lane :beta do
+    api_key = build_api_key
+
+    # 1) 同步证书 / Provisioning Profile（只读）
+    match(
+      type: "appstore",
+      readonly: true,
+      api_key: api_key,
+      app_identifier: APP_IDENTIFIER,
+    )
+
+    # 2) 自增 build number = TestFlight 上的最新值 + 1
+    next_build = (latest_testflight_build_number(
+      api_key: api_key,
+      app_identifier: APP_IDENTIFIER,
+      initial_build_number: 0,
+    ).to_i + 1)
+    UI.message("Next build number: #{next_build}")
+    increment_build_number(
+      build_number: next_build,
+      xcodeproj: XCODEPROJ,
+    )
+
+    # 3) 打包 IPA（手动签名，使用 match 同步下来的 profile）
+    profile_name = ENV["sigh_#{APP_IDENTIFIER}_appstore_profile-name"] ||
+                   "match AppStore #{APP_IDENTIFIER}"
+
+    build_app(
+      workspace:        WORKSPACE,
+      scheme:           SCHEME,
+      configuration:    CONFIGURATION,
+      export_method:    EXPORT_METHOD,
+      output_directory: OUTPUT_DIR,
+      output_name:      OUTPUT_IPA_NAME,
+      clean:            true,
+      include_symbols:  true,
+      include_bitcode:  false,
+      export_options: {
+        method: EXPORT_METHOD,
+        signingStyle: "manual",
+        provisioningProfiles: {
+          APP_IDENTIFIER => profile_name,
+        },
+      },
+    )
+
+    # 4) 上传到 TestFlight
+    upload_to_testflight(
+      api_key: api_key,
+      app_identifier: APP_IDENTIFIER,
+      ipa: File.join(OUTPUT_DIR, OUTPUT_IPA_NAME),
+      skip_waiting_for_build_processing: true,
+      skip_submission: true,
+      changelog: ENV["FL_CHANGELOG"],
+    )
+
+    UI.success("✅ TestFlight 上传完成（build #{next_build}）")
+  end
+
+  desc "仅同步证书（本地首次初始化时关掉 readonly 用真账号 + nuke 创建新证书）"
+  lane :sync_certs do
+    api_key = build_api_key
+    match(
+      type: "appstore",
+      readonly: true,
+      api_key: api_key,
+      app_identifier: APP_IDENTIFIER,
+    )
+  end
+
+  desc "【一次性】首次初始化 match 证书库：在空仓库里生成 distribution 证书 + appstore profile，并加密推送"
+  lane :init_certs do
+    api_key = build_api_key
+    # readonly=false：允许在 Apple Developer 上创建新的证书 / profile，并写回 git 仓库
+    match(
+      type: "appstore",
+      readonly: false,
+      force: true,                 # 强制重新生成 provisioning profile
+      api_key: api_key,
+      app_identifier: APP_IDENTIFIER,
+      git_url: ENV.fetch("MATCH_GIT_URL"),
+      git_basic_authorization: ENV["MATCH_GIT_BASIC_AUTHORIZATION"],
+      branch: ENV["MATCH_GIT_REPO_NAME_AS_BRANCH"],
+      storage_mode: "git",
+    )
+    UI.success("✅ 证书已写入 #{ENV['MATCH_GIT_URL']}，之后主 workflow 即可 readonly 使用")
+  end
+
+  desc "【危险】清空 Apple Developer 上的证书（distribution）"
+  lane :nuke_certs do
+    api_key = build_api_key
+    match_nuke(
+      type: "distribution",
+      api_key: api_key,
+      skip_confirmation: true,
+      git_url: ENV.fetch("MATCH_GIT_URL"),
+      git_basic_authorization: ENV["MATCH_GIT_BASIC_AUTHORIZATION"],
+      branch: ENV["MATCH_GIT_REPO_NAME_AS_BRANCH"],
+    )
+  end
+
+  # ----------------------------------------------------------------
+  # private helpers
+  # ----------------------------------------------------------------
+  def build_api_key
+    app_store_connect_api_key(
+      key_id:                 ENV.fetch("APPSTORE_KEY_ID"),
+      issuer_id:              ENV.fetch("APPSTORE_ISSUER_ID"),
+      key_content:            ENV.fetch("APPSTORE_PRIVATE_KEY"),
+      is_key_content_base64:  false,
+      in_house:               false,
+      duration:               1200,
+    )
+  end
+end
