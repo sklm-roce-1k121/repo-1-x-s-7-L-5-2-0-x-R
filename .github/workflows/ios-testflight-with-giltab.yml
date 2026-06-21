@@ -1,0 +1,218 @@
+name: iOS TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      changelog:
+        description: "TestFlight 测试人员看到的更新说明（可选）"
+        required: false
+        default: "Internal build from GitHub Actions."
+  push:
+    tags:
+      - 'v*'
+
+# 防止同一分支并发跑包导致 build number 冲突。
+concurrency:
+  group: ios-testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & Upload to TestFlight
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      FLUTTER_VERSION: "3.44.1"
+      RUBY_VERSION: "3.3"
+      # ================= 配置你的 GitLab 环境变量 =================
+      GITLAB_URL: "https://gitlab.wujia.lllidancloud.com:35678" # 👈 请修改为你的 GitLab 域名或 IP
+      PROJECT_ID: "1" # 👈 请修改为你的 GitLab 项目数字 ID
+      GITLAB_TOKEN: ${{ secrets.GITLAB_CI_REPORTER }}   # 👈 记得在 GitHub Settings -> Secrets 里配置这个 Token
+      GIT_SHA: "35b13823d8bcee2df0160387329bc13586ea058e"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      # ================= 【步骤 1：创建 GitLab Task】 =================
+      - name: Create GitLab Task for Tracking
+        id: create_task
+        run: |
+          echo "🚀 Creating task in GitLab..."
+          
+          # 发送请求并把返回的 JSON 存入变量
+          RESPONSE=$(curl --silent --request POST \
+            --header "PRIVATE-TOKEN: ${{ env.GITLAB_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --url "${{ env.GITLAB_URL }}/api/v4/projects/${{ env.PROJECT_ID }}/issues" \
+            --data '{
+              "title": "WJL Actions #${{ github.run_number }} - iOS 打包中 ",
+              "description": "自动由 WJL Actions 触发\n\n- 触发分支/Tag: `${{ github.ref_name }}`\n- 提交哈希: ${{ env.GIT_SHA }}",
+              "issue_type": "task"
+            }')
+          
+          # 从 JSON 中提取 iid (使用 macOS 自带的 python3)
+          ISSUE_IID=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('iid', ''))")
+          
+          if [ -z "$ISSUE_IID" ] || [ "$ISSUE_IID" = "None" ]; then
+            echo "❌ 获取 GitLab iid 失败，API 返回结果: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "✅ 成功创建 GitLab Task，IID 为: $ISSUE_IID"
+          # 将 iid 存入步骤输出，供后续步骤读取
+          echo "issue_iid=$ISSUE_IID" >> $GITHUB_OUTPUT
+
+      # ================= 【编译准备与打包环境配置】 =================
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Setup Ruby ${{ env.RUBY_VERSION }} (with bundler cache)
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+          bundler-cache: true
+          working-directory: ios
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          ruby --version
+          bundle --version
+          xcodebuild -version
+
+      - name: Flutter pub get
+        run: |
+          set -o pipefail # 🎯 核心：只要 flutter 失败，整步立刻报错，不再往下走
+          flutter pub get 2>&1 | tee /tmp/prep_error.log
+
+      - name: Flutter build iOS (no codesign)
+        run: |
+          set -o pipefail # 🎯 核心：只要 flutter 失败，整步立刻报错，不再往下走
+          flutter build ios --release --no-codesign 2>&1 | tee /tmp/prep_error.log
+
+      - name: CocoaPods install (skip if SwiftPM only)
+        working-directory: ios
+        run: |
+          set -o pipefail # 🎯 核心：只要 flutter 失败，整步立刻报错，不再往下走
+          if [ -f Podfile ]; then
+            echo "ℹ️  Podfile found, running pod install..."
+            bundle exec pod install --repo-update 2>&1 | tee /tmp/prep_error.log
+          else
+            echo "✅ No Podfile found. Project uses Swift Package Manager only, skipping."
+          fi
+
+      # ================= 【核心步骤：Fastlane 打包与上架】 =================
+      - name: Fastlane - match + gym + pilot
+        id: fastlane  # 👈 关键：增加了 id 以便最后一步捕捉其运行状态
+        working-directory: ios
+        env:
+          APPSTORE_ISSUER_ID:    ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID:       ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_PRIVATE_KEY:  ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          MATCH_PASSWORD:        ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL:         ${{ secrets.MATCH_GIT_URL }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_GIT_REPO_NAME_AS_BRANCH: ${{ github.repository_name }}
+          FL_CHANGELOG:          ${{ github.event.inputs.changelog || format('Build from git@{0}', github.sha) }}
+          FASTLANE_DISABLE_COLORS: 1
+          FASTLANE_HIDE_CHANGELOG: 1
+          FASTLANE_SKIP_UPDATE_CHECK: 1
+          FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: 120
+          FASTLANE_XCODEBUILD_SETTINGS_RETRIES: 6
+          LC_ALL: en_US.UTF-8
+          LANG: en_US.UTF-8
+        run: bundle exec fastlane beta
+
+      - name: Upload IPA artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: |
+            ios/build/*.ipa
+            ios/build/*.dSYM.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ================= 【步骤 2：打包成功后，追加 GitLab 评论】 =================
+      - name: Comment Success on GitLab
+        if: success() # 仅在前面所有步骤都成功时执行
+        run: |
+          IID="${{ steps.create_task.outputs.issue_iid }}"
+          echo "📝 Commenting success on GitLab Task #$IID..."
+
+          # 🎯 使用 YAML 多行块，避免外层单引号与内层单引号冲突
+          curl --request POST \
+            --header "PRIVATE-TOKEN: ${{ env.GITLAB_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --url "${{ env.GITLAB_URL }}/api/v4/projects/${{ env.PROJECT_ID }}/issues/$IID/notes" \
+            --data @- <<EOF
+          {
+            "body": "🎉 **iOS 自动打包并上架 TestFlight 成功！**\n\n- **运行编号**: #${{ github.run_number }}\n- **更新日志**: \`${{ github.event.inputs.changelog || '见代码提交记录' }}\`\n- 请前往 TestFlight 或 App Store Connect 查看最新 Build。"
+          }
+          EOF
+
+      # ================= 【步骤 3：打包失败后，智能化追加 GitLab 评论】 =================
+      - name: Comment Failure on GitLab
+        if: failure()
+        run: |
+          IID="${{ steps.create_task.outputs.issue_iid }}"
+          FASTLANE_OUTCOME="${{ steps.fastlane.outcome }}"
+          
+          echo "❌ Job failed. Fastlane outcome was: $FASTLANE_OUTCOME"
+          
+          # 1. 根据状态判断失败阶段并提取错误日志
+          if [ "$FASTLANE_OUTCOME" = "failure" ]; then
+            STAGE_NAME="Xcode 打包/上架"
+            ERROR_LOG="错误发生在 Xcode 打包阶段，请联系管理员查看。"
+          else
+            STAGE_NAME="前置环境/编译准备"
+            if [ -f /tmp/prep_error.log ]; then
+              ERROR_LOG=$(tail -n 25 /tmp/prep_error.log)
+            else
+              ERROR_LOG="未抓取到准备阶段的独立日志文件。"
+            fi
+          fi
+          
+          # 2. 将 Markdown 写入临时文本文件（完全避免 YAML 引擎对特殊字符的解析）
+          cat << EOF > raw_markdown.txt
+          🚨 **iOS 构建流失败！**
+          
+          - **运行编号**: #${{ github.run_number }}
+          - **失败阶段**: $STAGE_NAME
+          
+          ### 📋 终端错误日志片段 (末尾25行):
+          \`\`\`bash
+          $ERROR_LOG
+          \`\`\`
+        
+          EOF
+          
+          # 3. 用 macOS 预装的 python3 将整个文本安全转换为合法的 JSON 字符串
+          JSON_BODY=$(python3 -c '
+          import json
+          with open("raw_markdown.txt", "r", encoding="utf-8") as f:
+              text = f.read()
+          print(json.dumps({"body": text}))
+          ')
+          
+          # 4. 发送给 GitLab API
+          echo "📝 Sending detailed failure comment to GitLab..."
+          curl --request POST \
+            --header "PRIVATE-TOKEN: ${{ env.GITLAB_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --url "${{ env.GITLAB_URL }}/api/v4/projects/${{ env.PROJECT_ID }}/issues/$IID/notes" \
+            --data "$JSON_BODY"
